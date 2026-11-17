@@ -28,6 +28,84 @@ const uint8_t kPollingRatePayloads[4][2] = {
     {0x01, 0xFE}, // 1000 Hz
 };
 
+// --- Attack Shark R11 Ultra vendor protocol ---
+// Recovered from HIDUsb.dll (UsbServer_* packet builders and the checksum
+// routine at 0x180010890) and the interface-1 report descriptor:
+//   Output report ID 0x08, 16 data bytes; Input report ID 0x08, 16 data bytes.
+// Wire layout (17 bytes including the report ID):
+//   [0]      report ID (0x08)
+//   [1]      sub-command
+//   [2]      reserved (0x00)
+//   [3..4]   big-endian config address
+//   [5]      payload length (0x00 for queries; the 0x80 bit is rejected)
+//   [6..15]  payload
+//   [16]     0x55 - sum(bytes[0..15])
+// Responses echo [1..4], put status in [2] (0 = ok), the returned length in [5]
+// and the data in [6..].
+constexpr uint8_t kR11ReportId = 0x08;
+
+uint8_t r11Checksum(const uint8_t *data, size_t length)
+{
+    uint8_t sum = 0;
+    for (size_t i = 0; i < length; ++i)
+        sum = static_cast<uint8_t>(sum + data[i]);
+    return static_cast<uint8_t>(0x55 - sum);
+}
+
+void buildR11Report(uint8_t out[17], uint8_t subcommand, uint8_t address,
+                    uint8_t flags, const uint8_t *payload, size_t payloadLength)
+{
+    std::memset(out, 0, 17);
+    out[0] = kR11ReportId;
+    out[1] = subcommand;
+    out[2] = 0x00;
+    out[3] = 0x00; // address high byte (all known settings live below 0x100)
+    out[4] = address;
+    out[5] = flags;
+    const size_t copyLen = std::min(payloadLength, size_t(10));
+    if (payload && copyLen > 0)
+        std::memcpy(out + 6, payload, copyLen);
+    out[16] = r11Checksum(out, 16);
+}
+
+uint8_t r11PollingRateCode(PollingRate rate)
+{
+    // usersetting/Config.ini "ReportRates": 125=8, 250=4, 500=2, 1000=1,
+    // 2000=16, 4000=32, 8000=64.
+    switch (rate) {
+    case PollingRate::Hz125:  return 8;
+    case PollingRate::Hz250:  return 4;
+    case PollingRate::Hz500:  return 2;
+    case PollingRate::Hz1000: return 1;
+    case PollingRate::Hz2000: return 16;
+    case PollingRate::Hz4000: return 32;
+    case PollingRate::Hz8000: return 64;
+    }
+    return 1;
+}
+
+// DPI stage encoding. The vendor app decodes a stored stage as
+//   dpi = (code + 1) * 50;  *2 if (flag & 0x11);  *100 if (flag & 0x22)
+// (see 0x140011290 in ATTACK  SHARK MOUSE HUB.exe). The inverse picks the
+// smallest multiplier that keeps the code within one byte.
+void r11EncodeDpi(int dpi, uint8_t &code, uint8_t &flag)
+{
+    const int clamped = std::clamp(dpi, kR11MinDpi, kR11MaxDpi);
+    int mult = 50;
+    if (clamped <= 12800) {
+        mult = 50;
+        flag = 0x00;
+    } else if (clamped <= 25600) {
+        mult = 100;
+        flag = 0x11;
+    } else {
+        mult = 200;
+        flag = 0x33;
+    }
+    const int value = (clamped + mult / 2) / mult - 1;
+    code = static_cast<uint8_t>(std::clamp(value, 0, 255));
+}
+
 QString readSysfsLine(const QString &path)
 {
     QFile f(path);
@@ -115,15 +193,16 @@ QList<DeviceInfo> AttackSharkDevice::enumerateDevices(bool allHidDevices)
     const QList<SysfsHidrawEntry> sysEntries = scanSysfsHidraw();
 
     for (const SysfsHidrawEntry &e : sysEntries) {
-        const bool isAttackShark = isAttackSharkDevice(e.vid, e.pid);
+        const bool isX11 = isAttackSharkDevice(e.vid, e.pid);
+        const bool isR11 = isR11UltraDevice(e.vid, e.pid);
+        const bool isSupported = isX11 || isR11;
 
-        if (!allHidDevices) {
-            if (!isAttackShark || e.interfaceNumber != kConfigInterface)
+        if (isSupported) {
+            const int configInterface = isR11 ? kR11ConfigInterface : kConfigInterface;
+            if (e.interfaceNumber != configInterface)
                 continue;
-        } else {
-            // In "all devices" mode, prefer interface 2 for multi-interface Attack Shark devices
-            if (isAttackShark && e.interfaceNumber != kConfigInterface)
-                continue;
+        } else if (!allHidDevices) {
+            continue;
         }
 
         DeviceInfo info;
@@ -131,9 +210,15 @@ QList<DeviceInfo> AttackSharkDevice::enumerateDevices(bool allHidDevices)
         info.hidrawPath = e.hidrawNode;
         info.vid        = e.vid;
         info.pid        = e.pid;
-        info.isWired    = (e.vid == kVendorId && isWiredPid(e.pid));
+        info.model      = isR11 ? DeviceModel::R11Ultra : DeviceModel::X11;
+        info.isWired    = isR11 ? isR11WiredPid(e.pid)
+                                : (e.vid == kVendorId && isWiredPid(e.pid));
 
-        if (isAttackShark) {
+        if (isR11) {
+            info.name = info.isWired
+                ? QStringLiteral("Attack Shark R11 Ultra (Wired / Charging)")
+                : QStringLiteral("Attack Shark R11 Ultra (2.4G Wireless)");
+        } else if (isX11) {
             info.name = info.isWired
                 ? QStringLiteral("Attack Shark X11 (Wired / Charging)")
                 : QStringLiteral("Attack Shark X11 (2.4G Wireless)");
@@ -166,17 +251,24 @@ QString AttackSharkDevice::resolveConfigHidrawPath(const QString &devicePath, bo
 {
     const QList<SysfsHidrawEntry> sysEntries = scanSysfsHidraw();
 
-    // Check if an Attack Shark X11 Wired connection is currently active.
-    // When the USB charging cable is plugged in, the mouse switches to Wired USB mode (1d57:fa61)
-    // and stops talking to the 2.4G wireless dongle (1d57:fa60), even if the dongle stays plugged in.
-    QString activeWiredHidraw;
-    QString activeWirelessHidraw;
+    // Track the currently active wired/wireless config node for each supported model.
+    // When the USB charging cable is plugged in, both mice switch to Wired USB mode and
+    // stop talking to the 2.4G wireless dongle, even if the dongle stays plugged in.
+    QString x11Wired, x11Wireless, r11Wired, r11Wireless;
     for (const SysfsHidrawEntry &e : sysEntries) {
-        if (e.vid == kVendorId && e.interfaceNumber == kConfigInterface) {
-            if (isWiredPid(e.pid) && activeWiredHidraw.isEmpty()) {
-                activeWiredHidraw = e.hidrawNode;
-            } else if (e.pid == kProductIdWireless && activeWirelessHidraw.isEmpty()) {
-                activeWirelessHidraw = e.hidrawNode;
+        if (isAttackSharkDevice(e.vid, e.pid) && e.interfaceNumber == kConfigInterface) {
+            if (isWiredPid(e.pid)) {
+                if (x11Wired.isEmpty())
+                    x11Wired = e.hidrawNode;
+            } else if (e.pid == kProductIdWireless && x11Wireless.isEmpty()) {
+                x11Wireless = e.hidrawNode;
+            }
+        } else if (isR11UltraDevice(e.vid, e.pid) && e.interfaceNumber == kR11ConfigInterface) {
+            if (isR11WiredPid(e.pid)) {
+                if (r11Wired.isEmpty())
+                    r11Wired = e.hidrawNode;
+            } else if (r11Wireless.isEmpty()) {
+                r11Wireless = e.hidrawNode;
             }
         }
     }
@@ -184,42 +276,62 @@ QString AttackSharkDevice::resolveConfigHidrawPath(const QString &devicePath, bo
     // 1. If devicePath is a specific /dev/hidraw* node, inspect what device it belongs to
     if (devicePath.startsWith(QStringLiteral("/dev/hidraw"))) {
         for (const SysfsHidrawEntry &e : sysEntries) {
-            if (e.hidrawNode == devicePath) {
-                // If the user/settings selected an Attack Shark X11 (e.g. wireless dongle),
-                // but the mouse is currently plugged in via USB cable, prioritize the active wired node!
-                if (isAttackSharkDevice(e.vid, e.pid) && !activeWiredHidraw.isEmpty()) {
-                    if (isWiredOut)
-                        *isWiredOut = true;
-                    return activeWiredHidraw;
-                }
-                if (e.interfaceNumber == kConfigInterface) {
-                    if (isWiredOut)
-                        *isWiredOut = (e.vid == kVendorId && isWiredPid(e.pid));
-                    return e.hidrawNode;
-                }
-                // Find sibling Interface 2 on the same USB device
-                for (const SysfsHidrawEntry &sibling : sysEntries) {
-                    if (sibling.usbDirPath == e.usbDirPath && sibling.interfaceNumber == kConfigInterface) {
-                        if (isWiredOut)
-                            *isWiredOut = (sibling.vid == kVendorId && isWiredPid(sibling.pid));
-                        return sibling.hidrawNode;
-                    }
-                }
-                break;
+            if (e.hidrawNode != devicePath)
+                continue;
+
+            const bool isR11 = isR11UltraDevice(e.vid, e.pid);
+            const bool isX11 = isAttackSharkDevice(e.vid, e.pid);
+            const int configInterface = isR11 ? kR11ConfigInterface : kConfigInterface;
+            const QString &activeWired = isR11 ? r11Wired : x11Wired;
+
+            // If the user selected a wireless node but the mouse is plugged in via USB
+            // cable, prioritize the active wired node for the same model.
+            if ((isR11 || isX11) && !activeWired.isEmpty()) {
+                if (isWiredOut)
+                    *isWiredOut = true;
+                return activeWired;
             }
+
+            if (e.interfaceNumber == configInterface) {
+                if (isWiredOut)
+                    *isWiredOut = isR11 ? isR11WiredPid(e.pid)
+                                        : (e.vid == kVendorId && isWiredPid(e.pid));
+                return e.hidrawNode;
+            }
+
+            // Find the config interface on the same USB device
+            for (const SysfsHidrawEntry &sibling : sysEntries) {
+                if (sibling.usbDirPath == e.usbDirPath && sibling.interfaceNumber == configInterface) {
+                    if (isWiredOut)
+                        *isWiredOut = isR11 ? isR11WiredPid(sibling.pid)
+                                            : (sibling.vid == kVendorId && isWiredPid(sibling.pid));
+                    return sibling.hidrawNode;
+                }
+            }
+            break;
         }
     }
 
-    // 2. Fallback / auto-priority: Wired Attack Shark X11 first, then 2.4G Wireless Attack Shark X11
-    if (!activeWiredHidraw.isEmpty()) {
+    // 2. Fallback / auto-priority: R11 Ultra first, then X11; wired before wireless.
+    if (!r11Wired.isEmpty()) {
         if (isWiredOut)
             *isWiredOut = true;
-        return activeWiredHidraw;
+        return r11Wired;
     }
-    if (!activeWirelessHidraw.isEmpty()) {
+    if (!x11Wired.isEmpty()) {
+        if (isWiredOut)
+            *isWiredOut = true;
+        return x11Wired;
+    }
+    if (!r11Wireless.isEmpty()) {
         if (isWiredOut)
             *isWiredOut = false;
-        return activeWirelessHidraw;
+        return r11Wireless;
+    }
+    if (!x11Wireless.isEmpty()) {
+        if (isWiredOut)
+            *isWiredOut = false;
+        return x11Wireless;
     }
 
     return {};
@@ -228,23 +340,39 @@ QString AttackSharkDevice::resolveConfigHidrawPath(const QString &devicePath, bo
 bool AttackSharkDevice::openDevice(const QString &devicePath)
 {
     closeDevice();
+    m_lastError.clear();
 
     bool wired = false;
     const QString hidraw = resolveConfigHidrawPath(devicePath, &wired);
-    if (hidraw.isEmpty())
+    if (hidraw.isEmpty()) {
+        m_lastError = QStringLiteral("No supported Attack Shark interface found.");
         return false;
+    }
 
     int fd = ::open(hidraw.toUtf8().constData(), O_RDWR | O_NONBLOCK);
     if (fd < 0) {
+        const int savedErrno = errno;
         fd = ::open(hidraw.toUtf8().constData(), O_RDONLY | O_NONBLOCK);
-        if (fd < 0)
+        if (fd < 0) {
+            m_lastError = QStringLiteral("Cannot open %1: %2. Install packaging/70-attackshark.rules "
+                                         "into /etc/udev/rules.d, then replug the device.")
+                              .arg(hidraw, QString::fromLocal8Bit(std::strerror(savedErrno)));
             return false;
+        }
     }
 
     m_devicePath = devicePath;
     m_hidrawPath = hidraw;
     m_fd         = fd;
     m_isWired    = wired;
+
+    m_model = DeviceModel::X11;
+    for (const SysfsHidrawEntry &e : scanSysfsHidraw()) {
+        if (e.hidrawNode == hidraw) {
+            m_model = detectDeviceModel(e.vid, e.pid);
+            break;
+        }
+    }
 
     m_readNotifier = new QSocketNotifier(m_fd, QSocketNotifier::Read, this);
     connect(m_readNotifier, &QSocketNotifier::activated,
@@ -324,6 +452,21 @@ void AttackSharkDevice::onHidrawReadyRead()
 
 void AttackSharkDevice::parseIncomingReport(const uint8_t *buf, ssize_t length)
 {
+    if (m_model == DeviceModel::R11Ultra) {
+        // R11 Ultra telemetry arrives as 17-byte reports (report ID 0x08 + 16 bytes).
+        // Keep the last checksum-valid report so pollBatteryR11() can consume it even
+        // when the QSocketNotifier already drained the fd.
+        if (length >= 17 && buf[0] == kR11ReportId && r11Checksum(buf, 16) == buf[16]) {
+            std::memcpy(m_r11LastReport.data(), buf, 17);
+            m_r11HasReport = true;
+            if (qEnvironmentVariableIsSet("ATTACKSHARK_DEBUG")) {
+                qInfo().noquote() << "RX R11 report"
+                                  << QByteArray(reinterpret_cast<const char *>(buf), 17).toHex(' ');
+            }
+        }
+        return;
+    }
+
     // Attack Shark X11 wireless packet handling on Interface 2:
     // 1. DPI Stage Switch Notification from physical mouse button:
     // Signature: [0x03, 0x10, 0x10, <stage 1-based>, 0x00]
@@ -373,6 +516,9 @@ BatteryStatus AttackSharkDevice::pollBatteryOnce(int timeoutMs)
 
     if (m_fd < 0)
         return m_lastBattery;
+
+    if (m_model == DeviceModel::R11Ultra)
+        return pollBatteryR11(timeoutMs);
 
     onHidrawReadyRead();
     if (m_isWired) {
@@ -601,6 +747,9 @@ bool AttackSharkDevice::applyConfiguration(const MouseConfig &config, QString *e
         return false;
     }
 
+    if (m_model == DeviceModel::R11Ultra)
+        return applyConfigurationR11(config, errorMessage);
+
     // 1. Send DPI & Sensor Report first (Report 0x04)
     uint8_t dpiReport[56];
     buildDpiAndSensorReport(config, dpiReport);
@@ -645,6 +794,182 @@ bool AttackSharkDevice::sendColorReport(const MouseConfig &config, QString *erro
     const bool ok = sendFeatureReport(colorReport, sizeof(colorReport), errorMessage);
     onHidrawReadyRead();
     return ok;
+}
+
+// ---------------------------------------------------------------------------
+// Attack Shark R11 Ultra
+// ---------------------------------------------------------------------------
+
+bool AttackSharkDevice::sendR11Report(const uint8_t report[17], QString *errorMessage)
+{
+    checkHotplugTransition();
+
+    int targetFd = m_fd;
+    bool tempOpened = false;
+
+    if (targetFd < 0) {
+        const QString hidraw = m_hidrawPath.isEmpty()
+            ? resolveConfigHidrawPath(m_devicePath)
+            : m_hidrawPath;
+        if (hidraw.isEmpty()) {
+            if (errorMessage)
+                *errorMessage = QStringLiteral("Attack Shark R11 Ultra configuration interface not found.");
+            return false;
+        }
+        targetFd = ::open(hidraw.toUtf8().constData(), O_RDWR | O_NONBLOCK);
+        if (targetFd < 0) {
+            if (errorMessage)
+                *errorMessage = QStringLiteral("Cannot open %1: %2")
+                                    .arg(hidraw, QString::fromLocal8Bit(std::strerror(errno)));
+            return false;
+        }
+        tempOpened = true;
+    }
+
+    const ssize_t written = ::write(targetFd, report, 17);
+    const int savedErrno = errno;
+
+    if (qEnvironmentVariableIsSet("ATTACKSHARK_DEBUG")) {
+        qInfo().noquote() << "TX R11 report"
+                          << QByteArray(reinterpret_cast<const char *>(report), 17).toHex(' ')
+                          << "rc=" << written;
+    }
+
+    if (tempOpened)
+        ::close(targetFd);
+
+    if (written != 17) {
+        if (errorMessage) {
+            if (written < 0)
+                *errorMessage = QStringLiteral("HID output report failed: %1")
+                                    .arg(QString::fromLocal8Bit(std::strerror(savedErrno)));
+            else
+                *errorMessage = QStringLiteral("HID output report truncated (%1/17 bytes)").arg(written);
+        }
+        return false;
+    }
+
+    return true;
+}
+
+bool AttackSharkDevice::r11WriteByte(uint8_t address, uint8_t value, QString *errorMessage)
+{
+    // Sub-command 0x07 writes a value + its 0x55-complement at a config address.
+    const uint8_t payload[2] = { value, static_cast<uint8_t>(0x55 - value) };
+    uint8_t report[17];
+    buildR11Report(report, 0x07, address, 2, payload, 2);
+    return sendR11Report(report, errorMessage);
+}
+
+bool AttackSharkDevice::r11WriteDpiStage(int stageIndex, int dpi, QString *errorMessage)
+{
+    if (stageIndex < 0 || stageIndex >= kR11DpiStages)
+        return false;
+
+    uint8_t code = 0;
+    uint8_t flag = 0;
+    r11EncodeDpi(dpi, code, flag);
+    const uint8_t payload[4] = {
+        code, code, flag,
+        static_cast<uint8_t>(0x55 - (code + code + flag))
+    };
+
+    uint8_t report[17];
+    buildR11Report(report, 0x07, static_cast<uint8_t>(0x0C + 4 * stageIndex),
+                   4, payload, 4);
+    return sendR11Report(report, errorMessage);
+}
+
+bool AttackSharkDevice::r11ReadResponse(uint8_t out[17], int timeoutMs)
+{
+    // Prefer a report already captured by the socket notifier.
+    if (m_r11HasReport) {
+        std::memcpy(out, m_r11LastReport.data(), 17);
+        m_r11HasReport = false;
+        return true;
+    }
+
+    if (m_fd < 0)
+        return false;
+
+    struct pollfd pfd {};
+    pfd.fd     = m_fd;
+    pfd.events = POLLIN;
+
+    const int rc = ::poll(&pfd, 1, timeoutMs);
+    if (rc <= 0 || !(pfd.revents & POLLIN))
+        return false;
+
+    uint8_t buf[64];
+    const ssize_t n = ::read(m_fd, buf, sizeof(buf));
+    if (n < 17)
+        return false;
+    if (buf[0] != kR11ReportId)
+        return false;
+    if (r11Checksum(buf, 16) != buf[16])
+        return false;
+
+    std::memcpy(out, buf, 17);
+    return true;
+}
+
+bool AttackSharkDevice::applyConfigurationR11(const MouseConfig &config, QString *errorMessage)
+{
+    // 1. Polling rate (config address 0x00)
+    if (!r11WriteByte(0x00, r11PollingRateCode(config.pollingRate), errorMessage))
+        return false;
+    QThread::msleep(kInterReportDelayMs);
+
+    // 2. DPI stages (config addresses 0x0C, 0x10, ... — 3-byte groups)
+    for (int i = 0; i < kDpiStagesCount; ++i) {
+        if (!r11WriteDpiStage(i, config.dpiStages[i].dpi, errorMessage))
+            return false;
+        QThread::msleep(kInterReportDelayMs);
+    }
+
+    // 3. Active DPI stage (config address 0x04)
+    const uint8_t activeStage = static_cast<uint8_t>(
+        std::clamp(config.activeDpiStage, 0, kDpiStagesCount - 1));
+    if (!r11WriteByte(0x04, activeStage, errorMessage))
+        return false;
+
+    onHidrawReadyRead();
+    return true;
+}
+
+BatteryStatus AttackSharkDevice::pollBatteryR11(int timeoutMs)
+{
+    if (m_isWired) {
+        m_lastBattery.isCharging = true;
+        return m_lastBattery;
+    }
+
+    m_r11HasReport = false;
+
+    // Sub-command 0x04 = read battery level.
+    uint8_t report[17];
+    buildR11Report(report, 0x04, 0x00, 0, nullptr, 0);
+    if (!sendR11Report(report, nullptr))
+        return m_lastBattery;
+
+    // Give the socket notifier a chance to capture the reply, then fall back to a
+    // direct timed read.
+    onHidrawReadyRead();
+
+    uint8_t response[17];
+    if (r11ReadResponse(response, timeoutMs) && response[1] == 0x04 && response[2] == 0x00) {
+        // Verified on hardware: [6] = percentage, [7] = charging flag.
+        const int pct = static_cast<int>(response[6]);
+        const bool charging = response[7] != 0;
+        if (pct >= 0 && pct <= 100 &&
+            (m_lastBattery.percentage != pct || m_lastBattery.isCharging != charging)) {
+            m_lastBattery.percentage = pct;
+            m_lastBattery.isCharging = charging;
+            emit batteryStatusChanged(m_lastBattery);
+        }
+    }
+
+    return m_lastBattery;
 }
 
 } // namespace attackshark

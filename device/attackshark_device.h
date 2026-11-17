@@ -32,6 +32,8 @@ public:
     QString currentHidrawPath() const { return m_hidrawPath; }
     bool isConnected() const { return m_fd >= 0; }
     bool isWiredMode() const { return m_isWired; }
+    DeviceModel model() const { return m_model; }
+    QString lastError() const { return m_lastError; }
 
     // Apply full mouse configuration (DPI & Sensor first, LED/Power/Debounce second, Polling Rate third)
     bool applyConfiguration(const MouseConfig &config, QString *errorMessage = nullptr);
@@ -64,13 +66,25 @@ private:
     static void buildColorAndPowerReport(const MouseConfig &config, uint8_t out[15]);
     static void buildDpiAndSensorReport(const MouseConfig &config, uint8_t out[56]);
 
+    // --- Attack Shark R11 Ultra (vendor HID protocol, report ID 0x08) ---
+    bool applyConfigurationR11(const MouseConfig &config, QString *errorMessage);
+    BatteryStatus pollBatteryR11(int timeoutMs);
+    bool sendR11Report(const uint8_t report[17], QString *errorMessage);
+    bool r11WriteByte(uint8_t address, uint8_t value, QString *errorMessage);
+    bool r11WriteDpiStage(int stageIndex, int dpi, QString *errorMessage);
+    bool r11ReadResponse(uint8_t out[17], int timeoutMs);
+
     QString m_devicePath;
     QString m_hidrawPath;
     int m_fd = -1;
     bool m_isWired = false;
+    DeviceModel m_model = DeviceModel::X11;
     QSocketNotifier *m_readNotifier = nullptr;
     QTimer *m_hotplugTimer = nullptr;
     BatteryStatus m_lastBattery;
+    std::array<uint8_t, 17> m_r11LastReport {};
+    bool m_r11HasReport = false;
+    QString m_lastError;
 };
 
 } // namespace attackshark

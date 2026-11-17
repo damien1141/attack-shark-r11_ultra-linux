@@ -1,9 +1,12 @@
 #include "atsx11.h"
+#include "core/profile_store.h"
 
 #include <QApplication>
 #include <QColor>
 #include <QPalette>
+#include <QSettings>
 #include <QStyleFactory>
+#include <QTextStream>
 
 namespace {
 
@@ -43,6 +46,46 @@ void applyDarkTheme(QApplication &app)
 int main(int argc, char *argv[])
 {
     QApplication app(argc, argv);
+
+    if (app.arguments().contains(QStringLiteral("--list-devices"))) {
+        QTextStream out(stdout);
+        const QList<attackshark::DeviceInfo> devices =
+            attackshark::AttackSharkDevice::enumerateDevices(true);
+        if (devices.isEmpty()) {
+            out << "No supported devices found.\n";
+            return 1;
+        }
+        for (const attackshark::DeviceInfo &d : devices) {
+            out << d.hidrawPath << "  "
+                << QStringLiteral("%1:%2").arg(d.vid, 4, 16, QLatin1Char('0'))
+                                           .arg(d.pid, 4, 16, QLatin1Char('0'))
+                << "  " << (d.isWired ? "wired" : "wireless")
+                << "  " << d.name << "\n";
+        }
+        return 0;
+    }
+
+    if (app.arguments().contains(QStringLiteral("--apply"))) {
+        QTextStream out(stdout);
+        QSettings qSettings(QStringLiteral("AttackShark"), QStringLiteral("X11"));
+        const attackshark::MouseConfig cfg = attackshark::profiles::readConfig(qSettings);
+
+        attackshark::AttackSharkDevice device;
+        const QString path = attackshark::AttackSharkDevice::findDefaultDevicePath();
+        if (path.isEmpty()) {
+            out << "No supported device found.\n";
+            return 1;
+        }
+        if (!device.openDevice(path)) {
+            out << "Open failed: " << device.lastError() << "\n";
+            return 1;
+        }
+        QString err;
+        const bool ok = device.applyConfiguration(cfg, &err);
+        out << (ok ? "Applied" : "Apply failed: " + err) << "\n";
+        return ok ? 0 : 1;
+    }
+
     applyDarkTheme(app);
     app.setQuitOnLastWindowClosed(false);
 

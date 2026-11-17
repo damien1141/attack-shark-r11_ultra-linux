@@ -4,3 +4,4 @@ aur/
 .vscode/
 tmp.md
 graphify-out/
+.ref/

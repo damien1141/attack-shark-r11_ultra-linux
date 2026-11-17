@@ -143,7 +143,7 @@
       <item>
        <widget class="QGroupBox" name="grp_dpiStages">
         <property name="title">
-         <string>Onboard DPI Stages (50–22000 DPI)</string>
+         <string>Onboard DPI Stages (50–42000 DPI)</string>
         </property>
         <layout class="QVBoxLayout" name="dpiVerticalLayout">
          <item>
@@ -181,7 +181,7 @@
               <number>50</number>
              </property>
              <property name="maximum">
-              <number>22000</number>
+              <number>42000</number>
              </property>
              <property name="singleStep">
               <number>50</number>
@@ -208,7 +208,7 @@
               <number>50</number>
              </property>
              <property name="maximum">
-              <number>22000</number>
+              <number>42000</number>
              </property>
              <property name="singleStep">
               <number>50</number>
@@ -238,7 +238,7 @@
               <number>50</number>
              </property>
              <property name="maximum">
-              <number>22000</number>
+              <number>42000</number>
              </property>
              <property name="singleStep">
               <number>50</number>
@@ -265,7 +265,7 @@
               <number>50</number>
              </property>
              <property name="maximum">
-              <number>22000</number>
+              <number>42000</number>
              </property>
              <property name="singleStep">
               <number>50</number>
@@ -292,7 +292,7 @@
               <number>50</number>
              </property>
              <property name="maximum">
-              <number>22000</number>
+              <number>42000</number>
              </property>
              <property name="singleStep">
               <number>50</number>
@@ -357,6 +357,21 @@
              <item>
               <property name="text">
                <string>1000Hz</string>
+              </property>
+             </item>
+             <item>
+              <property name="text">
+               <string>2000Hz</string>
+              </property>
+             </item>
+             <item>
+              <property name="text">
+               <string>4000Hz</string>
+              </property>
+             </item>
+             <item>
+              <property name="text">
+               <string>8000Hz</string>
               </property>
              </item>
             </widget>

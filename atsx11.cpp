@@ -355,14 +355,37 @@ void atsx11::connectToDevice(const QString &devicePath)
         ui->pbar_batteryinfo->setEnabled(false);
         ui->lbl_isCharging->setEnabled(false);
         ui->lbl_debug->setText(
-            QStringLiteral("<span style='color:#ff6b6b;'>Device not found or permission denied (%1)</span>")
-                .arg(devicePath));
+            QStringLiteral("<span style='color:#ff6b6b;'>Device not found or permission denied (%1): %2</span>")
+                .arg(devicePath, m_device.lastError()));
         return;
     }
 
     ui->btn_apply->setEnabled(true);
     ui->lbl_batteryinfo->setEnabled(true);
     ui->pbar_batteryinfo->setEnabled(true);
+
+    // Adapt limits to the detected model: the X11 (PAW3311) tops out at 22000 DPI
+    // and 1000 Hz, the R11 Ultra (PAW3950) supports 42000 DPI and 8000 Hz.
+    m_isLoadingSettings = true;
+    const bool isR11 = (m_device.model() == attackshark::DeviceModel::R11Ultra);
+    const int maxDpi = isR11 ? attackshark::kR11MaxDpi : attackshark::kMaxDpi;
+    for (QSpinBox *spin : m_stageSpins) {
+        if (spin)
+            spin->setMaximum(maxDpi);
+    }
+    ui->grp_dpiStages->setTitle(isR11
+        ? QStringLiteral("Onboard DPI Stages (50\u201342000 DPI)")
+        : QStringLiteral("Onboard DPI Stages (50\u201322000 DPI)"));
+
+    auto *pollModel = ui->cbox_pollingrate->model();
+    for (int i = 0; i < ui->cbox_pollingrate->count(); ++i) {
+        const bool supported = isR11 || i <= static_cast<int>(attackshark::PollingRate::Hz1000);
+        pollModel->setData(pollModel->index(i, 0),
+                           supported ? QVariant() : QVariant(0), Qt::UserRole - 1);
+    }
+    if (!isR11 && ui->cbox_pollingrate->currentIndex() > static_cast<int>(attackshark::PollingRate::Hz1000))
+        ui->cbox_pollingrate->setCurrentIndex(static_cast<int>(attackshark::PollingRate::Hz1000));
+    m_isLoadingSettings = false;
 
     const attackshark::BatteryStatus initial = m_device.pollBatteryOnce(300);
     if (initial.isValid()) {

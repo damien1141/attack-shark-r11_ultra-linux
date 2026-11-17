@@ -22,16 +22,58 @@ constexpr bool isAttackSharkDevice(uint16_t vid, uint16_t pid) {
     return vid == kVendorId && (pid == kProductIdWireless || isWiredPid(pid));
 }
 
+// --- Attack Shark R11 Ultra (PAW3950 sensor, NRF52840 MCU, 8K dongle) ---
+// Device identity and profile values extracted from the vendor
+// "ATTACK SHARK MOUSE HUB" package (HIDUsb.dll + usersetting/Config.ini).
+constexpr uint16_t kVendorIdR11          = 0x3554;
+constexpr uint16_t kR11PidWired          = 0xFB43;
+constexpr uint16_t kR11PidWiredAlt1      = 0xF516;
+constexpr uint16_t kR11PidWiredAlt2      = 0xF515;
+constexpr uint16_t kR11PidWireless8K     = 0xFB44;
+constexpr uint16_t kR11PidWireless8KAlt1 = 0xFB35;
+constexpr uint16_t kR11PidWireless8KAlt2 = 0xF517;
+constexpr int      kR11ConfigInterface   = 1;
+
+constexpr bool isR11WiredPid(uint16_t pid) {
+    return pid == kR11PidWired || pid == kR11PidWiredAlt1 || pid == kR11PidWiredAlt2;
+}
+
+constexpr bool isR11WirelessPid(uint16_t pid) {
+    return pid == kR11PidWireless8K || pid == kR11PidWireless8KAlt1 || pid == kR11PidWireless8KAlt2;
+}
+
+constexpr bool isR11UltraDevice(uint16_t vid, uint16_t pid) {
+    return vid == kVendorIdR11 && (isR11WiredPid(pid) || isR11WirelessPid(pid));
+}
+
+enum class DeviceModel {
+    X11,
+    R11Ultra
+};
+
+constexpr DeviceModel detectDeviceModel(uint16_t vid, uint16_t pid) {
+    return isR11UltraDevice(vid, pid) ? DeviceModel::R11Ultra : DeviceModel::X11;
+}
+
 constexpr int kDpiStagesCount = 5;
 constexpr int kMinDpi         = 50;
 constexpr int kMaxDpi         = 22000;
 constexpr int kDpiStep        = 50;
 
+// R11 Ultra sensor limits (Config.ini DPIRange=50,26000,50,26100,42000,100,0x11)
+constexpr int kR11MinDpi        = 50;
+constexpr int kR11MaxDpi        = 42000;
+constexpr int kR11LowRangeMax   = 26000; // above this, 100-DPI steps and high-range flag
+constexpr int kR11DpiStages     = 6;     // Config.ini DPIMaxGrade=6
+
 enum class PollingRate : int {
     Hz125  = 0,
     Hz250  = 1,
     Hz500  = 2,
-    Hz1000 = 3
+    Hz1000 = 3,
+    Hz2000 = 4,
+    Hz4000 = 5,
+    Hz8000 = 6
 };
 
 enum class ColorMode : int {
@@ -121,7 +163,9 @@ struct DpiStageConfig {
     int dpi = 800;
 
     int clampedDpi() const {
-        const int clamped = std::clamp(dpi, kMinDpi, kMaxDpi);
+        // Accept the widest supported range here; each backend clamps to its own
+        // sensor limit (X11/PAW3311 tops out at 22000, R11 Ultra at 42000).
+        const int clamped = std::clamp(dpi, kMinDpi, kR11MaxDpi);
         if (clamped > 10000) {
             return ((clamped + 50) / 100) * 100;
         }
@@ -186,7 +230,7 @@ struct MouseConfig {
         if (keyResponseTimeMs < 4 || keyResponseTimeMs > 50 || (keyResponseTimeMs % 2) != 0)
             return false;
         for (const auto &stage : dpiStages) {
-            if (stage.dpi < kMinDpi || stage.dpi > kMaxDpi)
+            if (stage.dpi < kMinDpi || stage.dpi > kR11MaxDpi)
                 return false;
         }
         return true;
@@ -201,11 +245,12 @@ struct BatteryStatus {
 
 struct DeviceInfo {
     QString path;       // e.g. /dev/hidraw7 or /dev/hidraw18
-    QString hidrawPath; // e.g. /dev/hidraw7 (Interface 2 for config/telemetry)
+    QString hidrawPath; // e.g. /dev/hidraw7 (config/telemetry interface)
     QString name;
     uint16_t vid = 0;
     uint16_t pid = 0;
     bool isWired = false;
+    DeviceModel model = DeviceModel::X11;
 };
 
 } // namespace attackshark
